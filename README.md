@@ -8,9 +8,8 @@ Extrahiert aus dem in `ratum` gewachsenen Muster (ADR-012), damit `ratum` und
 zu duplizieren. Siehe [TF-845](https://linear.app/talent-factory/issue/TF-845)
 fuer den vollen Kontext.
 
-> **Status**: Repo-Skeleton (TF-853) — noch ohne fachliche Logik. Die
-> eigentliche Extraktion (OTel-Setup, Logging, Scrubbing) folgt in
-> nachgelagerten Tasks derselben EPIC.
+> **Status**: `/client-errors`-Frontend-Client + `ErrorBoundary`-Helper (TF-854). Weitere
+> Bausteine (u. a. rrweb-Session-Replay, TF-855) folgen in nachgelagerten Tasks derselben EPIC.
 
 ## Installation
 
@@ -29,6 +28,36 @@ npm install github:talent-factory/specula-client-js#v0.1.0
   }
 }
 ```
+
+## Client-Errors + ErrorBoundary
+
+`createErrorReporter()` meldet Browser-Fehler an den App-eigenen `/client-errors`-Proxy-Endpoint
+(der Endpoint selbst bleibt pro Repo — siehe [TF-845](https://linear.app/talent-factory/issue/TF-845),
+Grilling Q12). `ErrorBoundary` faengt zusaetzlich React-Render-Fehler ab, die React sonst nicht an
+`window.onerror` propagiert:
+
+```tsx
+import { ErrorBoundary, createErrorReporter } from "@talent-factory/specula-client";
+
+const reporter = createErrorReporter({ endpoint: "/api/v1/monitoring/client-errors" });
+
+// Global unhandled errors/rejections (ausserhalb des React-Render-Baums) — nur in Prod:
+if (import.meta.env.PROD) {
+  reporter.attachGlobalHandlers();
+}
+
+function App() {
+  return (
+    <ErrorBoundary onError={reporter.reportError}>
+      <MyApp />
+    </ErrorBoundary>
+  );
+}
+```
+
+`reportError()` sanitized die gemeldete URL immer via `safeUrl()` (strippt Query-String und
+Fragment) und drosselt sich selbst (Default: max. 5 Reports pro Reporter-Instanz), damit ein sich
+wiederholender Frontend-Fehler nicht das Rate-Limit-Budget des Backend-Proxys aufbraucht.
 
 ## Versionierung
 

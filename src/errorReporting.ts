@@ -225,13 +225,24 @@ export function safeUrl(rawUrl: string): string {
     if (typeof window !== "undefined" && rawUrl.startsWith("/")) {
       try {
         const url = new URL(rawUrl, window.location.origin);
-        return `${url.origin}${url.pathname}`;
+        // Sicherheitskritisch: NICHT nur pruefen, dass rawUrl mit "/" beginnt — Protocol-relative
+        // URLs ("//evil.com/x") und Backslash-Varianten ("/\\evil.com", "\\/evil.com") beginnen
+        // ebenfalls mit "/", werden vom WHATWG-URL-Parser aber gegen ein FREMDES Origin aufgeloest
+        // (new URL("//evil.com", "https://app.example.com").origin === "https://evil.com"). Ein
+        // reiner String-Praefix-Check waere hier ein Parser/Validator-Differential: der Parser
+        // trifft am Ende eine andere Entscheidung als der vorgelagerte String-Check. Deshalb wird
+        // hier das tatsaechlich geparste Origin gegen das erwartete verglichen, nicht der rohe
+        // Input-String.
+        if (url.origin === window.location.origin) {
+          return `${url.origin}${url.pathname}`;
+        }
       } catch {
         // Faellt durch zum konservativen Fallback unten.
       }
     }
-    // Kein parsbares URL-Objekt — konservativ nichts Rohes weiterreichen, aber sichtbar machen,
-    // dass hier etwas verworfen wurde (statt eine leere `url` im Report unerklaert zu lassen).
+    // Kein parsbares/vertrauenswuerdiges URL-Objekt — konservativ nichts Rohes weiterreichen,
+    // aber sichtbar machen, dass hier etwas verworfen wurde (statt eine leere `url` im Report
+    // unerklaert zu lassen).
     console.warn(`specula-client: safeUrl() konnte "${rawUrl}" nicht parsen; url wird im Report weggelassen.`);
     return "";
   }

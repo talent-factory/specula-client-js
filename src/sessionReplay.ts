@@ -14,6 +14,13 @@
  * Zeitpunkt des Fehlers auf, nicht rueckwirkend. Sentrys "Buffered Replay"-Modus haelt dafuer
  * einen rollierenden Ring-Buffer vor dem eigentlichen Recording-Start vor — das ist ein separater,
  * deutlich groesserer Baustein und liegt ausserhalb des Umfangs dieses Tasks.
+ *
+ * Versionshinweis: {@link eventWithTime} kommt unveraendert aus `@rrweb/types` (re-exportiert ueber
+ * {@link SessionReplayEventBatch.events}), damit Server-seitige Konsumenten nicht gegen eine
+ * zweite, potenziell abweichende Kopie dieses Typs deserialisieren. `rrweb` ist mit einem
+ * Caret-Range (`^2.1.6`) gepinnt — ein Minor/Patch-Bump von `rrweb` kann `eventWithTime` aendern,
+ * ohne dass sich die Version DIESES Pakets aendert. Wer gegen `SessionReplayEventBatch` typprueft,
+ * erbt dieses Risiko.
  */
 
 import { record } from "rrweb";
@@ -31,8 +38,13 @@ export interface SessionReplayEventBatch {
   /** Vom Aufrufer gelieferte Session-/Trace-Korrelations-ID (siehe {@link
    * SessionReplayOptions.getCorrelationId}), zum Zeitpunkt DIESES Batches abgefragt — kann sich
    * ueber die Lebensdauer einer Session aendern (z. B. neue Trace-ID pro Request), deshalb pro
-   * Batch neu ermittelt statt einmalig bei {@link createSessionReplayRecorder} gecacht. */
-  correlationId: string | undefined;
+   * Batch neu ermittelt statt einmalig bei {@link createSessionReplayRecorder} gecacht. Optional
+   * (statt `string | undefined`), weil das auch der tatsaechlichen Wire-Semantik entspricht:
+   * `JSON.stringify(batch)` (siehe {@link SessionReplayRecorder.flush}) laesst Keys mit
+   * `undefined`-Wert komplett weg, ein Server-seitiger Konsument sieht also nie einen `null`-artig
+   * "vorhandenen, aber leeren" Wert, sondern schlicht kein `correlationId`-Feld — analog zu
+   * `ClientErrorPayload.componentStack?: string` in `errorReporting.ts`. */
+  correlationId?: string;
   samplingMode: SessionReplaySamplingMode;
   events: eventWithTime[];
 }
@@ -86,7 +98,12 @@ export interface SessionReplayRecorder {
    * Wuerfelt `sampleRate` und startet bei Erfolg sofort `rrweb.record()`. Bei Misserfolg bleibt
    * die Session "ungesampelt" — ein spaeterer {@link notifyError}-Aufruf kann das Recording
    * trotzdem noch nachtraeglich anstossen (zu `errorSampleRate`). Idempotent: wiederholte Aufrufe
-   * nach einem bereits entschiedenen/gestarteten/gestoppten Recorder sind No-ops.
+   * sind No-ops — auch wenn der (einmalige) `sampleRate`-Roll fehlgeschlagen ist. Ohne dieses
+   * Idempotenz-Versprechen wuerde jeder weitere `start()`-Aufruf (z. B. ein erneut feuernder
+   * React-Effect) einen zusaetzlichen, unabhaengigen Wurf bekommen und damit die effektive
+   * Sampling-Rate ueber den konfigurierten `sampleRate` hinaus anheben (`1-(1-sampleRate)^n` statt
+   * `sampleRate` bei n Aufrufen) — das wird ueber das separate `startRolled`-Flag im Closure-State
+   * verhindert, das unabhaengig vom Roll-Ergebnis gesetzt wird.
    */
   start(): void;
   /**
@@ -106,11 +123,20 @@ export interface SessionReplayRecorder {
    * beeintraechtigen. No-op, wenn der Puffer aktuell leer ist.
    */
   flush(): Promise<void>;
-  /** Stoppt `rrweb.record()`, raeumt den Intervall-Timer ab und flusht den verbleibenden Puffer
+  /**
+   * Stoppt `rrweb.record()`, raeumt den Intervall-Timer ab und flusht den verbleibenden Puffer
    * ein letztes Mal. Danach sind {@link start}/{@link notifyError} dauerhaft No-ops — ein
    * gestoppter Recorder wird nicht wiederverwendet, Aufrufer erzeugen fuer eine neue Session eine
-   * neue Instanz. */
-  stop(): void;
+   * neue Instanz.
+   *
+   * Gibt das Promise des finalen {@link flush} zurueck (das wie `flush()` selbst nie ablehnt/
+   * rejected). Aufrufer, denen es genuegt, dass der letzte Batch "bestmoeglich" abgeschickt wird
+   * (z. B. ein Effect-Cleanup beim Unmount), koennen das Promise ignorieren — ein
+   * `no-floating-promises`-Lint ist in diesem Package nicht aktiv. Aufrufer, die vor einer
+   * Seiten-Navigation sicherstellen wollen, dass der letzte Batch tatsaechlich abgeschickt wurde
+   * (bzw. der Fehlschlag geloggt ist), koennen `await recorder.stop()` nutzen.
+   */
+  stop(): Promise<void>;
 }
 
 const DEFAULT_SAMPLE_RATE = 0.1;
@@ -179,6 +205,11 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
   // undefined = noch nicht entschieden/aufgezeichnet; bleibt danach dauerhaft gesetzt (auch nach
   // stop()) als Metadatum fuer den finalen flush()-Batch.
   let samplingMode: SessionReplaySamplingMode | undefined;
+  // Getrennt von samplingMode: haelt fest, DASS start() bereits den (einmaligen) sampleRate-Roll
+  // gemacht hat — unabhaengig davon, ob der Roll erfolgreich war. samplingMode allein reicht dafuer
+  // NICHT, da es nur bei Erfolg (in beginRecording()) gesetzt wird; ohne dieses Flag wuerde ein
+  // zweiter start()-Aufruf nach einem fehlgeschlagenen Roll erneut wuerfeln (siehe start()-Doc).
+  let startRolled = false;
   let stopped = false;
 
   function handleEmit(event: eventWithTime): void {
@@ -188,14 +219,32 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
     }
   }
 
+  // Setzt samplingMode VOR dem record()-Aufruf: rrweb kann emit() synchron innerhalb von record()
+  // feuern (initialer Full-Snapshot), also muss samplingMode schon stehen, bevor handleEmit()
+  // ueberhaupt erreichbar ist — sonst waere die Invariante in flush() (samplingMode nie undefined,
+  // wenn buffer nicht leer ist) verletzt.
   function beginRecording(mode: SessionReplaySamplingMode): void {
     samplingMode = mode;
-    stopRecordingFn = record({
+    const stopFn = record({
       emit: handleEmit,
       maskAllInputs: !dangerouslyDisableDefaultPrivacy,
       maskTextSelector: dangerouslyDisableDefaultPrivacy ? undefined : "*",
       blockSelector: dangerouslyDisableDefaultPrivacy ? undefined : DEFAULT_BLOCKED_MEDIA_SELECTOR,
     });
+    if (stopFn === undefined) {
+      // rrweb.record() faengt Init-Fehler intern ab (z. B. fehlendes DOM in einem SSR-Kontext,
+      // CSP-Restriktionen) und liefert dann undefined statt zu werfen. Ohne diese Pruefung wuerde
+      // stopRecordingFn nie gesetzt (isRecording() bliebe fuer immer false), aber der
+      // flushTimer liefe trotzdem unbegrenzt weiter — ein Leak, der bei jedem weiteren
+      // notifyError()-Erfolg einen zusaetzlichen, nie wieder eingefangenen Timer aufmacht (isRecording()
+      // haette faelschlich signalisiert, dass noch nichts laeuft). Deshalb hier: sichtbar loggen,
+      // stopRecordingFn/flushTimer bewusst NICHT setzen.
+      console.error(
+        `specula-client: session-replay recording (mode=${mode}) konnte nicht gestartet werden — rrweb.record() lieferte keinen Stop-Handler zurueck (z. B. kein DOM verfuegbar oder CSP-Restriktion).`,
+      );
+      return;
+    }
+    stopRecordingFn = stopFn;
     flushTimer = setInterval(() => void flush(), batchIntervalMs);
   }
 
@@ -204,9 +253,12 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
   }
 
   function start(): void {
-    if (stopped || samplingMode !== undefined) {
+    if (stopped || startRolled) {
       return;
     }
+    // Wird VOR dem Wuerfeln gesetzt, nicht erst bei Erfolg (anders als samplingMode) — genau das
+    // macht start() auch nach einem verlorenen Roll idempotent, siehe start()-Doc im Interface.
+    startRolled = true;
     if (Math.random() < sampleRate) {
       beginRecording("normal");
     }
@@ -227,16 +279,21 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
     }
     const events = buffer;
     buffer = [];
-    const batch: SessionReplayEventBatch = {
-      sessionId,
-      // samplingMode ist an dieser Stelle nie undefined: buffer kann nur ueber handleEmit()
-      // befuellt werden, und die ist erst nach beginRecording() (setzt samplingMode) als
-      // rrweb-emit-Callback aktiv.
-      samplingMode: samplingMode as SessionReplaySamplingMode,
-      correlationId: getCorrelationId?.(),
-      events,
-    };
+    // Batch-Konstruktion (inkl. des aufrufer-eigenen getCorrelationId()-Callbacks) UND der
+    // fetch()-Aufruf liegen beide im try: das "wirft nie"-Versprechen dieser Funktion (siehe
+    // Interface-Doc) gilt fuer die gesamte Funktion, nicht nur den Netzwerk-Aufruf (analog
+    // `reportError()` in `errorReporting.ts`) — ein werfender getCorrelationId() darf die gerade
+    // aus buffer entnommenen events nicht spurlos verschwinden lassen, ohne dass das geloggt wird.
     try {
+      const batch: SessionReplayEventBatch = {
+        sessionId,
+        // samplingMode ist an dieser Stelle nie undefined: buffer kann nur ueber handleEmit()
+        // befuellt werden, und die ist erst nach beginRecording() (setzt samplingMode) als
+        // rrweb-emit-Callback aktiv.
+        samplingMode: samplingMode as SessionReplaySamplingMode,
+        correlationId: getCorrelationId?.(),
+        events,
+      };
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -248,15 +305,18 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
       });
       if (!response.ok) {
         console.error(
-          `specula-client: session-replay batch upload failed (endpoint=${endpoint}): HTTP ${response.status}`,
+          `specula-client: session-replay batch upload failed (endpoint=${endpoint}): HTTP ${response.status}, ${events.length} Events verworfen.`,
         );
       }
     } catch (err) {
-      console.error(`specula-client: session-replay batch upload failed (endpoint=${endpoint}):`, err);
+      console.error(
+        `specula-client: session-replay batch upload failed (endpoint=${endpoint}), ${events.length} Events verworfen:`,
+        err,
+      );
     }
   }
 
-  function stop(): void {
+  async function stop(): Promise<void> {
     if (stopped) {
       return;
     }
@@ -269,7 +329,7 @@ export function createSessionReplayRecorder(options: SessionReplayOptions): Sess
       stopRecordingFn();
       stopRecordingFn = undefined;
     }
-    void flush();
+    await flush();
   }
 
   return { sessionId, start, notifyError, isRecording, flush, stop };

@@ -161,6 +161,22 @@ describe("createSessionReplayRecorder — Sampling", () => {
     expect(randomSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("is idempotent even when the first sampleRate roll failed: a second start() call does not re-roll", () => {
+    // Regression test: samplingMode (the previous idempotency guard) is only set on a *successful*
+    // roll, so a naive re-implementation would re-roll Math.random() on every subsequent start()
+    // call until one succeeds — silently inflating the effective sample rate above `sampleRate`.
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.99); // jeder Roll schlaegt fehl
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 0.1 });
+
+    recorder.start();
+    recorder.start();
+    recorder.start();
+
+    expect(randomSpy).toHaveBeenCalledTimes(1);
+    expect(recorder.isRecording()).toBe(false);
+    expect(recordMock).not.toHaveBeenCalled();
+  });
+
   it("upgrades an unsampled session to recording at errorSampleRate via notifyError", () => {
     vi.spyOn(Math, "random").mockReturnValueOnce(0.99).mockReturnValueOnce(0);
     const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 0.1, errorSampleRate: 1 });
@@ -195,6 +211,47 @@ describe("createSessionReplayRecorder — Sampling", () => {
     expect(randomSpy).toHaveBeenCalledTimes(1); // notifyError() hat nicht erneut gewuerfelt
   });
 
+  it("never records when sampleRate is exactly 0, even on a near-zero random() roll", () => {
+    // Math.random() returns [0, 1), so `0 < 0` must always be false — an off-by-one on the
+    // comparison operator (e.g. `<=` instead of `<`) would silently start recording here.
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 0 });
+
+    recorder.start();
+
+    expect(recorder.isRecording()).toBe(false);
+    expect(recordMock).not.toHaveBeenCalled();
+  });
+
+  it("always records when sampleRate is exactly 1, even on a near-one random() roll", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.999999);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 1 });
+
+    recorder.start();
+
+    expect(recorder.isRecording()).toBe(true);
+  });
+
+  it("never upgrades via notifyError when errorSampleRate is exactly 0", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 0, errorSampleRate: 0 });
+
+    recorder.start();
+    recorder.notifyError();
+
+    expect(recorder.isRecording()).toBe(false);
+  });
+
+  it("notifyError() works as the very first call on a fresh recorder, without a prior start()", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, errorSampleRate: 1 });
+
+    recorder.notifyError();
+
+    expect(recorder.isRecording()).toBe(true);
+    expect(recordMock).toHaveBeenCalledTimes(1);
+  });
+
   it("re-rolls errorSampleRate on each notifyError call until it succeeds", () => {
     vi.spyOn(Math, "random")
       .mockReturnValueOnce(0.99) // start(): nicht regulaer gesampelt
@@ -211,6 +268,41 @@ describe("createSessionReplayRecorder — Sampling", () => {
     recorder.notifyError();
 
     expect(recorder.isRecording()).toBe(true);
+  });
+});
+
+describe("createSessionReplayRecorder — record() liefert keinen Stop-Handler", () => {
+  // rrweb.record() faengt Init-Fehler intern ab (fehlendes DOM in SSR, CSP-Restriktionen, ...) und
+  // liefert dann `undefined` statt zu werfen — kein synthetischer Edge-Case, sondern rrwebs
+  // dokumentiertes Verhalten.
+  it("does not report as recording and does not arm the flush timer when record() returns undefined", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    recordMock.mockReturnValue(undefined);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT });
+
+    recorder.start();
+
+    expect(recorder.isRecording()).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("rrweb.record()"));
+  });
+
+  it("does not leak an interval timer across repeated notifyError() attempts when record() keeps returning undefined", () => {
+    vi.spyOn(Math, "random").mockReturnValueOnce(0.99).mockReturnValue(0); // start() ungesampelt, jeder weitere Roll erfolgreich
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    recordMock.mockReturnValue(undefined);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, sampleRate: 0.1, errorSampleRate: 1 });
+
+    recorder.start();
+    recorder.notifyError();
+    recorder.notifyError();
+    recorder.notifyError();
+
+    // Ohne den beginRecording()-Fix wuerde jeder erfolgreiche notifyError()-Roll einen weiteren,
+    // nie wieder eingefangenen setInterval aufmachen, weil isRecording() (stopRecordingFn ===
+    // undefined) faelschlich weiterhin "nicht aufzeichnend" meldet.
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -336,6 +428,46 @@ describe("createSessionReplayRecorder — Batching", () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("413"));
   });
+
+  it("logs and does not throw when the caller-supplied getCorrelationId callback throws", async () => {
+    // Regression test: flush()'s try/catch used to start AFTER the buffer swap and the
+    // getCorrelationId() call, so a throwing callback would drop the just-dequeued events with no
+    // console signal at all — a silent-failure gap distinct from the network-error path above.
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const recorder = createSessionReplayRecorder({
+      endpoint: ENDPOINT,
+      getCorrelationId: () => {
+        throw new Error("no active trace context");
+      },
+    });
+
+    recorder.start();
+    emitEvents(1);
+
+    await expect(recorder.flush()).resolves.toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("session-replay batch upload failed"),
+      expect.any(Error),
+    );
+  });
+
+  it("does not double-send events when a manual flush() overlaps an auto-flush from batchMaxEvents", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT, batchIntervalMs: 1000, batchMaxEvents: 3 });
+
+    recorder.start();
+    emitEvents(3); // triggert einen Auto-Flush ueber handleEmit() (fire-and-forget)
+    await recorder.flush(); // manueller Flush, direkt danach — Puffer ist zu diesem Zeitpunkt bereits geleert
+    await vi.advanceTimersByTimeAsync(1000); // Intervall-Timer laeuft ebenfalls noch mit
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string) as {
+      events: unknown[];
+    };
+    expect(body.events).toHaveLength(3);
+  });
 });
 
 describe("createSessionReplayRecorder — stop", () => {
@@ -399,5 +531,32 @@ describe("createSessionReplayRecorder — stop", () => {
 
     expect(stopRecordingSpy).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("is safe to call before start() was ever called", async () => {
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT });
+
+    await expect(recorder.stop()).resolves.toBeUndefined();
+
+    expect(stopRecordingSpy).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(recorder.isRecording()).toBe(false);
+  });
+
+  it("returns a promise that resolves only once the final flush has completed", async () => {
+    // stop() now returns Promise<void> (previously void, fire-and-forget) so callers who need to
+    // know the last batch was actually sent before e.g. a navigation can await it.
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const recorder = createSessionReplayRecorder({ endpoint: ENDPOINT });
+
+    recorder.start();
+    emitEvents(2);
+    await recorder.stop();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string) as {
+      events: unknown[];
+    };
+    expect(body.events).toHaveLength(2);
   });
 });

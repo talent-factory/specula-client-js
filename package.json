@@ -34,8 +34,12 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "rrweb": "^2.1.6"
+  },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
+    "@rrweb/types": "^2.1.6",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.10.2",

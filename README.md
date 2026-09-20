@@ -122,6 +122,7 @@ Deaktivieren ueber ein gewoehnliches `false`-Flag. Events werden alle `batchInte
 Es gibt keine npm-Registry-Releases. Versionen sind Git-Tags nach
 [SemVer](https://semver.org/) (`vMAJOR.MINOR.PATCH`). Konsumenten pinnen
 in ihrer `package.json` immer auf ein konkretes Tag, nie auf `main`/`develop`.
+Aenderungen pro Version stehen im [CHANGELOG](CHANGELOG.md).
 
 ## Entwicklung
 

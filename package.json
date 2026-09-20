@@ -1,6 +1,6 @@
 {
   "name": "@talent-factory/specula-client",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Shared OTel/Logging/PII-Scrubbing client SDK for Specula-monitored products (JS/TS).",
   "private": true,
   "license": "UNLICENSED",

@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import { SPECULA_CLIENT_VERSION } from "./index.js";
+import { ErrorBoundary, SPECULA_CLIENT_VERSION, createErrorReporter, safeUrl } from "./index.js";
 
-// Leere Test-Suite fuers Repo-Skeleton (TF-853) — stellt nur sicher, dass
-// Build/Test-Pipeline funktioniert. Echte Tests kommen mit der fachlichen
-// Logik (OTel-Setup, Logging, PII-Scrubbing) in Folge-Tasks der EPIC TF-845.
-describe("specula-client (skeleton)", () => {
-  it("is importierbar", () => {
+// Smoke-Test fuers Package-Barrel: stellt sicher, dass die oeffentliche API tatsaechlich
+// importierbar ist (u. a. dass ErrorBoundary.tsx sauber durch tsc/vitest kompiliert). Fachliche
+// Tests fuer die einzelnen Bausteine leben in errorReporting.test.ts/ErrorBoundary.test.tsx.
+describe("specula-client (public API)", () => {
+  it("exports the package version", () => {
     expect(SPECULA_CLIENT_VERSION).toBe("0.0.0");
+  });
+
+  it("exports the client-errors reporter and ErrorBoundary", () => {
+    expect(createErrorReporter).toBeTypeOf("function");
+    expect(safeUrl).toBeTypeOf("function");
+    expect(ErrorBoundary).toBeTypeOf("function");
   });
 });

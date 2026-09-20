@@ -1,4 +1,10 @@
 {
   "extends": "./tsconfig.json",
-  "exclude": ["src/**/*.test.ts"]
+  "compilerOptions": {
+    // Browser-only Public-API: verhindert, dass ambiente @types/node-Globals (z. B. `process`,
+    // `Buffer`) in den ausgelieferten .d.ts-Dateien auftauchen oder versehentlich im Quellcode
+    // verwendet werden, ohne dass tsc das beim Build meldet.
+    "types": []
+  },
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test/**"]
 }

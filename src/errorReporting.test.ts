@@ -50,6 +50,26 @@ describe("safeUrl", () => {
   it("resolves a relative path against window.location.origin instead of dropping it", () => {
     expect(safeUrl("/verify-email?token=super-secret")).toBe(`${window.location.origin}/verify-email`);
   });
+
+  it("rejects a protocol-relative URL instead of resolving it to a foreign origin", () => {
+    // Security-Regression: new URL("//evil.com/x", window.location.origin) loest gegen das
+    // FREMDE Origin "https://evil.com" auf, obwohl der rohe String mit "/" beginnt. Ein reiner
+    // String-Praefix-Check waere hier ein Parser/Validator-Differential.
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(safeUrl("//evil.com/steal?token=abc")).toBe("");
+
+    consoleSpy.mockRestore();
+  });
+
+  it("rejects backslash-variant origin-confusion attempts", () => {
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(safeUrl("/\\evil.com/x")).toBe("");
+    expect(safeUrl("\\/evil.com/x")).toBe("");
+
+    consoleSpy.mockRestore();
+  });
 });
 
 describe("createErrorReporter", () => {

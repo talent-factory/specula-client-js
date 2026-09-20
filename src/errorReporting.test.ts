@@ -4,14 +4,21 @@ import { createErrorReporter, safeUrl } from "./errorReporting.js";
 
 const ENDPOINT = "/client-errors";
 
+// attachGlobalHandlers() haengt echte "error"/"unhandledrejection"-Listener an `window` — die
+// muessen zwischen Tests wieder entfernt werden, sonst feuern Listener aelterer Tests bei
+// dispatchEvent() in spaeteren Tests mit und verfaelschen die fetch-Call-Reihenfolge.
+let detachHandlers: Array<() => void> = [];
+
 beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true }));
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  window.onerror = null;
-  window.onunhandledrejection = null;
+  for (const detach of detachHandlers) {
+    detach();
+  }
+  detachHandlers = [];
 });
 
 describe("safeUrl", () => {
@@ -31,8 +38,29 @@ describe("safeUrl", () => {
     );
   });
 
-  it("returns an empty string for an unparsable URL", () => {
+  it("returns an empty string for an unparsable URL and warns", () => {
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
     expect(safeUrl("not a valid url")).toBe("");
+
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("not a valid url"));
+    consoleSpy.mockRestore();
+  });
+
+  it("resolves a relative path against window.location.origin instead of dropping it", () => {
+    expect(safeUrl("/verify-email?token=super-secret")).toBe(`${window.location.origin}/verify-email`);
+  });
+});
+
+describe("createErrorReporter", () => {
+  it("throws synchronously for an empty endpoint instead of failing silently later", () => {
+    expect(() => createErrorReporter({ endpoint: "" })).toThrow(/endpoint/);
+    expect(() => createErrorReporter({ endpoint: "   " })).toThrow(/endpoint/);
+  });
+
+  it("throws synchronously for an invalid maxReports instead of silently disabling the cap", () => {
+    expect(() => createErrorReporter({ endpoint: ENDPOINT, maxReports: -1 })).toThrow(/maxReports/);
+    expect(() => createErrorReporter({ endpoint: ENDPOINT, maxReports: Number.NaN })).toThrow(/maxReports/);
   });
 });
 
@@ -106,7 +134,23 @@ describe("createErrorReporter().reportError", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("caps the number of reports at the configured maxReports", async () => {
+  it("does not let duplicates consume the maxReports budget meant for distinct errors", async () => {
+    // Regression-Schutz: shouldReport() muss den Dedup-Check VOR dem Inkrementieren von
+    // reportCount ausfuehren. Wuerde ein Duplikat versehentlich das Budget verbrauchen, ginge
+    // hier der dritte, tatsaechlich neue Fehler verloren.
+    const reporter = createErrorReporter({ endpoint: ENDPOINT, maxReports: 2 });
+    const duplicate = { message: "repeat-me", stack: "at foo", url: "https://app.example.com/x", userAgent: "" };
+
+    for (let i = 0; i < 5; i += 1) {
+      await reporter.reportError(duplicate);
+    }
+    await reporter.reportError({ message: "distinct", stack: "", url: "https://app.example.com/x", userAgent: "" });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps the number of reports at the configured maxReports and warns once", async () => {
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const reporter = createErrorReporter({ endpoint: ENDPOINT, maxReports: 2 });
 
     for (let i = 0; i < 5; i += 1) {
@@ -119,9 +163,13 @@ describe("createErrorReporter().reportError", () => {
     }
 
     expect(fetch).toHaveBeenCalledTimes(2);
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("maxReports"));
+    consoleSpy.mockRestore();
   });
 
   it("defaults maxReports to 5", async () => {
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const reporter = createErrorReporter({ endpoint: ENDPOINT });
 
     for (let i = 0; i < 10; i += 1) {
@@ -134,6 +182,7 @@ describe("createErrorReporter().reportError", () => {
     }
 
     expect(fetch).toHaveBeenCalledTimes(5);
+    consoleSpy.mockRestore();
   });
 
   it("keeps separate throttle state per reporter instance", async () => {
@@ -148,22 +197,22 @@ describe("createErrorReporter().reportError", () => {
 });
 
 describe("createErrorReporter().attachGlobalHandlers", () => {
-  it("forwards window.onerror to reportError", () => {
+  it("forwards window 'error' events to reportError", () => {
     const reporter = createErrorReporter({ endpoint: ENDPOINT });
-    reporter.attachGlobalHandlers();
+    detachHandlers.push(reporter.attachGlobalHandlers());
 
-    window.onerror!("Script error", "app.js", 1, 1, new Error("boom"));
+    window.dispatchEvent(new ErrorEvent("error", { message: "Script error", error: new Error("boom") }));
 
     expect(fetch).toHaveBeenCalled();
   });
 
-  it("falls back to the raw message when window.onerror has no Error object", () => {
-    // Cross-Origin-Skriptfehler feuern window.onerror mit error === null ("Script error.") — der
-    // Fall, fuer den `error?.message ?? String(message)` existiert.
+  it("falls back to the raw message when the error event has no Error object", () => {
+    // Cross-Origin-Skriptfehler feuern das error-Event mit error === null ("Script error.") — der
+    // Fall, fuer den `event.error instanceof Error ? ... : event.message` existiert.
     const reporter = createErrorReporter({ endpoint: ENDPOINT });
-    reporter.attachGlobalHandlers();
+    detachHandlers.push(reporter.attachGlobalHandlers());
 
-    window.onerror!("Script error.", "app.js", 1, 1, undefined);
+    window.dispatchEvent(new ErrorEvent("error", { message: "Script error.", error: undefined }));
 
     const call = vi.mocked(fetch).mock.calls[0]!;
     const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
@@ -171,28 +220,71 @@ describe("createErrorReporter().attachGlobalHandlers", () => {
     expect(body.stack).toBe("");
   });
 
-  it("forwards window.onunhandledrejection to reportError", () => {
+  it("forwards window 'unhandledrejection' events to reportError", () => {
     const reporter = createErrorReporter({ endpoint: ENDPOINT });
-    reporter.attachGlobalHandlers();
+    detachHandlers.push(reporter.attachGlobalHandlers());
 
     const event = new Event("unhandledrejection") as PromiseRejectionEvent;
     Object.defineProperty(event, "reason", { value: new Error("rejected") });
-    window.onunhandledrejection!(event);
+    window.dispatchEvent(event);
 
     expect(fetch).toHaveBeenCalled();
   });
 
+  it("falls back to an empty stack when the rejection reason has none", () => {
+    // Analog zum entsprechenden ErrorBoundary-Test: `reason.stack ?? ""` war bislang unverifiziert
+    // (die bisherige Rejection mit new Error(...) hat immer einen echten Stack).
+    const reporter = createErrorReporter({ endpoint: ENDPOINT });
+    detachHandlers.push(reporter.attachGlobalHandlers());
+
+    const reasonWithoutStack = new Error("rejected without stack");
+    Object.defineProperty(reasonWithoutStack, "stack", { value: undefined });
+    const event = new Event("unhandledrejection") as PromiseRejectionEvent;
+    Object.defineProperty(event, "reason", { value: reasonWithoutStack });
+    window.dispatchEvent(event);
+
+    const call = vi.mocked(fetch).mock.calls[0]!;
+    const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.stack).toBe("");
+  });
+
   it("falls back to String(reason) for a non-Error rejection", () => {
     const reporter = createErrorReporter({ endpoint: ENDPOINT });
-    reporter.attachGlobalHandlers();
+    detachHandlers.push(reporter.attachGlobalHandlers());
 
     const event = new Event("unhandledrejection") as PromiseRejectionEvent;
     Object.defineProperty(event, "reason", { value: "plain string rejection" });
-    window.onunhandledrejection!(event);
+    window.dispatchEvent(event);
 
     const call = vi.mocked(fetch).mock.calls[0]!;
     const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
     expect(body.message).toBe("plain string rejection");
     expect(body.stack).toBe("");
+  });
+
+  it("returns a detach function that removes the registered listeners", () => {
+    const reporter = createErrorReporter({ endpoint: ENDPOINT });
+    const detach = reporter.attachGlobalHandlers();
+
+    detach();
+    // Kein `error`-Objekt hier: mit null Listenern auf `window` wuerde Vitests eigener
+    // Test-Isolations-Schutz (`catchWindowErrors`) ein dispatchetes ErrorEvent mit echtem `.error`
+    // sonst selbst als Test-Crash behandeln — das waere ein Test-Artefakt, kein Verhalten der
+    // Bibliothek. Ohne `.error` bleibt der Zweck des Tests (kein reportError nach detach) intakt.
+    window.dispatchEvent(new ErrorEvent("error", { message: "after detach" }));
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not clobber a second reporter's global handlers (addEventListener composes)", () => {
+    const reporterA = createErrorReporter({ endpoint: ENDPOINT });
+    const reporterB = createErrorReporter({ endpoint: ENDPOINT });
+    detachHandlers.push(reporterA.attachGlobalHandlers(), reporterB.attachGlobalHandlers());
+
+    window.dispatchEvent(new ErrorEvent("error", { message: "boom", error: new Error("boom") }));
+
+    // Beide Instanzen haben eigenen Drossel-Zustand (maxReports=5 je Instanz) und sollten daher
+    // beide unabhaengig voneinander melden, statt dass die zweite Registrierung die erste ersetzt.
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

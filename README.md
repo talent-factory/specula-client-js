@@ -41,9 +41,13 @@ import { ErrorBoundary, createErrorReporter } from "@talent-factory/specula-clie
 
 const reporter = createErrorReporter({ endpoint: "/api/v1/monitoring/client-errors" });
 
-// Global unhandled errors/rejections (ausserhalb des React-Render-Baums) — nur in Prod:
+// Global unhandled errors/rejections (ausserhalb des React-Render-Baums) — nur in Prod. Der
+// Prod-Check ist hier exemplarisch mit Vite's import.meta.env geschrieben; die Bibliothek selbst
+// macht keine Annahme ueber Bundler/Env-Var-Konvention — im eigenen Produkt entsprechend anpassen.
 if (import.meta.env.PROD) {
-  reporter.attachGlobalHandlers();
+  const detach = reporter.attachGlobalHandlers();
+  // Bei Bedarf spaeter wieder abhaengen, z. B. in einem Test-Teardown oder React-Effect-Cleanup:
+  // detach();
 }
 
 function App() {
@@ -58,6 +62,11 @@ function App() {
 `reportError()` sanitized die gemeldete URL immer via `safeUrl()` (strippt Query-String und
 Fragment) und drosselt sich selbst (Default: max. 5 Reports pro Reporter-Instanz), damit ein sich
 wiederholender Frontend-Fehler nicht das Rate-Limit-Budget des Backend-Proxys aufbraucht.
+
+> **Sanitizing-Umfang**: `safeUrl()` deckt aktuell nur das `url`-Feld ab. `message`/`stack`/
+> `componentStack` werden unveraendert an den Endpoint gesendet und koennen theoretisch Query-
+> String-Fragmente aus Stacktraces enthalten (z. B. bei Inline-`<script>`/`eval`-Fehlern).
+> Vollstaendiges PII-/Token-Scrubbing dieser Felder ist ein spaeterer Baustein derselben EPIC.
 
 ## Versionierung
 

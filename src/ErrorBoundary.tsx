@@ -17,6 +17,10 @@ export interface ErrorBoundaryProps {
   fallback?: ReactNode;
 }
 
+/** `hasError` ist ein Einweg-Riegel: einmal `true`, bleibt er fuer die Lebensdauer dieser
+ * Boundary-Instanz `true` (kein "Retry"/Reset-Mechanismus). Fuer eine Root-Boundary wie das
+ * ratum-Vorbild ist das die richtige Grenze; fuer eine pro-Route verwendete Boundary bedeutet ein
+ * Fehler, dass der betroffene Teilbaum bis zum Unmount/Remount tot bleibt. */
 interface State {
   hasError: boolean;
 }
@@ -36,20 +40,30 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    this.props.onError({
-      message: error.message,
-      stack: error.stack ?? "",
-      url: window.location.href,
-      userAgent: navigator.userAgent,
-      componentStack: info.componentStack ?? "",
-    });
+    try {
+      this.props.onError({
+        message: error.message,
+        stack: error.stack ?? "",
+        url: window.location.href,
+        userAgent: navigator.userAgent,
+        componentStack: info.componentStack ?? "",
+      });
+    } catch (onErrorFailure) {
+      // Ein werfender onError-Callback darf die Boundary nicht selbst zum Absturz bringen — das
+      // waere genau der Fall, vor dem diese Komponente eigentlich schuetzen soll (der Fehler
+      // wuerde zur naechsthoeheren Boundary durchschlagen oder, falls keine existiert, die App
+      // crashen lassen).
+      console.error("specula-client: ErrorBoundary onError-Callback ist fehlgeschlagen:", onErrorFailure);
+    }
   }
 
   render(): ReactNode {
     if (this.state.hasError) {
-      return (
-        this.props.fallback ?? <p role="alert">Es ist ein Fehler aufgetreten. Bitte lade die Seite neu.</p>
-      );
+      // `fallback !== undefined` statt `??`, damit ein explizites `fallback={null}` ("bei Fehler
+      // nichts rendern") nicht mit "kein fallback angegeben" verwechselt wird.
+      return this.props.fallback !== undefined
+        ? this.props.fallback
+        : <p role="alert">Es ist ein Fehler aufgetreten. Bitte lade die Seite neu.</p>;
     }
     return this.props.children;
   }

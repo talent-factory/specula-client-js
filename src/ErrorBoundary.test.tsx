@@ -25,8 +25,10 @@ describe("ErrorBoundary", () => {
 
   it("renders the default fallback and reports the error when a child throws", () => {
     const onError = vi.fn();
-    // React loggt den Fehler zusaetzlich auf console.error — hier bewusst nicht unterdrueckt,
-    // damit ein Regressionsfehler beim Fallback selbst sichtbar bliebe.
+    // React loggt bei jedem gefangenen Render-Fehler zusaetzlich (u. a. via console.error) einen
+    // eigenen Stacktrace — hier gemockt, um den Testoutput sauber zu halten. Die eigentliche
+    // Regressionsabsicherung laeuft ueber die Assertions unten (Fallback-Text, onError-Aufruf),
+    // nicht ueber Konsolenoutput.
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     render(
@@ -88,5 +90,44 @@ describe("ErrorBoundary", () => {
     boundary.componentDidCatch(new Error("boom"), { componentStack: null as unknown as string });
 
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ componentStack: "" }));
+  });
+
+  it("renders nothing when fallback is explicitly null, instead of the default text", () => {
+    const onError = vi.fn();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { container } = render(
+      <ErrorBoundary onError={onError} fallback={null}>
+        <Boom />
+      </ErrorBoundary>,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText(/ist ein Fehler aufgetreten/i)).not.toBeInTheDocument();
+    consoleSpy.mockRestore();
+  });
+
+  it("does not crash the app when the onError callback itself throws", () => {
+    // Die Boundary ist die letzte Verteidigungslinie gegen Render-Fehler — ein Bug im
+    // Reporting-Callback des Konsumenten darf diese Garantie nicht wieder aufheben.
+    const onError = vi.fn(() => {
+      throw new Error("onError callback is broken");
+    });
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() =>
+      render(
+        <ErrorBoundary onError={onError}>
+          <Boom />
+        </ErrorBoundary>,
+      ),
+    ).not.toThrow();
+
+    expect(screen.getByText(/ist ein Fehler aufgetreten/i)).toBeInTheDocument();
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("onError-Callback ist fehlgeschlagen"),
+      expect.any(Error),
+    );
+    consoleSpy.mockRestore();
   });
 });
